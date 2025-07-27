@@ -1,0 +1,104 @@
+--1. Load any dataset into DBFS 2. Flatten JSON fields 3. Write flattened file as external parquet table--
+
+--Folder Structure--
+JSON-Flattening-Parquet/
+│
+├── notebooks/
+│   └── flatten_json_to_parquet.py (or .ipynb)
+│
+├── data/
+│   └── nested_sample.json  # (Optional sample input file)
+│
+├── README.md
+
+--flatten_json_to_parquet.py--
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, explode, flatten
+
+# __define-ocg__ Start Spark session
+spark = SparkSession.builder.appName("JSON Flatten and Parquet Table").getOrCreate()
+
+# Step 1: Load dataset (JSON) into DBFS
+json_path = "dbfs:/mnt/your_container/nested_sample.json"
+df = spark.read.option("multiline", "true").json(json_path)
+
+print("Original Schema:")
+df.printSchema()
+
+# Step 2: Flatten JSON fields
+def flatten_df(nested_df):
+    from pyspark.sql.types import StructType, ArrayType
+
+    flat_cols = []
+    nested_cols = []
+
+    for col_name, dtype in nested_df.dtypes:
+        if dtype.startswith("struct") or dtype.startswith("array"):
+            nested_cols.append(col_name)
+        else:
+            flat_cols.append(col_name)
+
+    while nested_cols:
+        col_name = nested_cols.pop(0)
+        field = nested_df.schema[col_name]
+
+        if isinstance(field.dataType, StructType):
+            for nested_field in field.dataType.fields:
+                new_col = f"{col_name}.{nested_field.name}"
+                nested_df = nested_df.withColumn(f"{col_name}_{nested_field.name}", col(new_col))
+            nested_df = nested_df.drop(col_name)
+        elif isinstance(field.dataType, ArrayType):
+            nested_df = nested_df.withColumn(col_name, explode(col(col_name)))
+
+        flat_cols = [c for c in nested_df.columns if c not in nested_cols]
+
+        nested_cols = [c for c in nested_df.columns if isinstance(nested_df.schema[c].dataType, (StructType, ArrayType))]
+
+    return nested_df
+
+flat_df = flatten_df(df)
+
+print("Flattened Schema:")
+flat_df.printSchema()
+
+# Step 3: Write as external parquet table
+parquet_path = "dbfs:/mnt/your_container/output/flattened_parquet"
+flat_df.write.mode("overwrite").parquet(parquet_path)
+
+# Register external table
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS json_flattened_table
+    USING PARQUET
+    LOCATION '{parquet_path}'
+""")
+
+--Mounting DBFS--
+configs = {"fs.azure.account.key.<your_storage_account>.blob.core.windows.net": "<your_key>"}
+
+dbutils.fs.mount(
+  source = "wasbs://<container_name>@<your_storage_account>.blob.core.windows.net",
+  mount_point = "/mnt/your_container",
+  extra_configs = configs)
+
+--Sample nested_sample.json--
+[
+  {
+    "id": 1,
+    "name": "Pushkar",
+    "address": {
+      "city": "Kolkata",
+      "state": "WB"
+    },
+    "orders": [
+      {
+        "order_id": "A1",
+        "amount": 150
+      },
+      {
+        "order_id": "A2",
+        "amount": 300
+      }
+    ]
+  }
+]
+

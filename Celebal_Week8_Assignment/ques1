@@ -1,0 +1,87 @@
+--"Load NYC taxi data to DataLake/Blob_Storage/DataBricks and extract the data through dataframe in the notebook. 
+Perform Following Queries using PySpark. Query 1. - Add a column named as ""Revenue"" into dataframe which is the 
+sum of the below columns 'Fare_amount','Extra','MTA_tax','Improvement_surcharge','Tip_amount','Tolls_amount',
+'Total_amount' Query 2. - Increasing count of total passengers in New York City by area Query 3. - Realtime Average 
+fare/total earning amount earned by 2 vendors Query 4. - Moving Count of payments made by each payment mode Query 5. 
+- Highest two gaining vendor's on a particular date with no of passenger and total distance by cab Query 6. - Most no of 
+passenger between a route of two location. Query 7. - Get top pickup locations with most passengers in last 5/10 seconds."--
+
+--Folder Structure--
+NYC-Taxi-Data-Analysis/
+│
+├── notebooks/
+│   └── nyc_taxi_analysis.py (or .ipynb if using notebook)
+│
+├── data/
+│   └── (Raw CSVs or external links if big)
+│
+├── README.md
+
+--nyc_taxi_analysis.py--
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum, avg, count, max, desc, window
+from pyspark.sql.window import Window
+
+# __define-ocg__ Start Spark
+spark = SparkSession.builder.appName("NYC Taxi Analysis").getOrCreate()
+
+# Load data from DataLake/Blob
+df = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("dbfs:/mnt/your_container/nyc_taxi_data.csv")
+
+df = df.cache()
+
+# Query 1: Add Revenue Column
+df = df.withColumn("Revenue", 
+    col("Fare_amount") + col("Extra") + col("MTA_tax") +
+    col("Improvement_surcharge") + col("Tip_amount") +
+    col("Tolls_amount") + col("Total_amount")
+)
+df.select("VendorID", "Revenue").show(5)
+
+# Query 2: Count total passengers by area (Assuming pickup_location column or ZIP exists)
+passenger_by_area = df.groupBy("PULocationID").agg(sum("passenger_count").alias("Total_Passengers")).orderBy(desc("Total_Passengers"))
+passenger_by_area.show(5)
+
+# Query 3: Realtime Average fare & earnings by 2 vendors
+avg_fare_vendor = df.groupBy("VendorID").agg(
+    avg("Fare_amount").alias("Avg_Fare"),
+    avg("Revenue").alias("Avg_Revenue")
+)
+avg_fare_vendor.show()
+
+# Query 4: Moving Count of Payments per payment_type
+payment_window = Window.partitionBy("payment_type").orderBy("tpep_pickup_datetime").rowsBetween(-5, 0)
+df = df.withColumn("Moving_Payment_Count", count("*").over(payment_window))
+df.select("payment_type", "tpep_pickup_datetime", "Moving_Payment_Count").show(5)
+
+# Query 5: Top 2 earning vendors on a given date
+from pyspark.sql.functions import to_date
+df_with_date = df.withColumn("trip_date", to_date("tpep_pickup_datetime"))
+top_vendors = df_with_date.groupBy("trip_date", "VendorID").agg(
+    sum("Revenue").alias("Total_Revenue"),
+    sum("passenger_count").alias("Total_Passengers"),
+    sum("trip_distance").alias("Total_Distance")
+)
+windowSpec = Window.partitionBy("trip_date").orderBy(desc("Total_Revenue"))
+top_2_vendors = top_vendors.withColumn("rank", dense_rank().over(windowSpec)).filter("rank <= 2")
+top_2_vendors.select("trip_date", "VendorID", "Total_Passengers", "Total_Distance", "Total_Revenue").show()
+
+# Query 6: Most passengers between route (pickup -> dropoff)
+route_passengers = df.groupBy("PULocationID", "DOLocationID").agg(sum("passenger_count").alias("Total_Passengers")).orderBy(desc("Total_Passengers"))
+route_passengers.show(1)
+
+# Query 7: Top pickup locations with most passengers in last 5/10 seconds
+from pyspark.sql.functions import unix_timestamp, current_timestamp
+df_with_ts = df.withColumn("pickup_unix", unix_timestamp("tpep_pickup_datetime"))
+current_time = unix_timestamp(current_timestamp())
+filtered_df = df_with_ts.withColumn("time_diff", current_time - col("pickup_unix")).filter("time_diff <= 10")
+top_pickup = filtered_df.groupBy("PULocationID").agg(sum("passenger_count").alias("Passengers")).orderBy(desc("Passengers"))
+top_pickup.show(5)
+
+--Mounting Blob Storage--
+configs = {"fs.azure.account.key.<your_storage_account>.blob.core.windows.net": "<your_key>"}
+
+dbutils.fs.mount(
+  source = "wasbs://<container_name>@<your_storage_account>.blob.core.windows.net",
+  mount_point = "/mnt/your_container",
+  extra_configs = configs)
